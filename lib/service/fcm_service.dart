@@ -1,342 +1,93 @@
-import 'dart:convert'; // Required for encoding/decoding local notification payload maps
-import 'package:fcm/main.dart';
-import 'package:fcm/screen/booking_detail_screen.dart';
-import 'package:fcm/screen/chat-screen.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/material.dart';
+import '../main.dart'; // Make sure this path correctly points to your main.dart
 
+class FcmService {
+  final FirebaseMessaging _messaging = FirebaseMessaging.instance;
 
-class FirebaseMessagingService {
-  static final FirebaseMessagingService _instance = FirebaseMessagingService._internal();
-  factory FirebaseMessagingService() => _instance;
-  FirebaseMessagingService._internal();
+  Future<void> init() async {
+    await Future.wait([
+      requestPermission(),
+      getToken(),
+    ]);
 
-  final FirebaseMessaging _firebaseMessaging = FirebaseMessaging.instance;
-  final FlutterLocalNotificationsPlugin _flutterLocalNotificationsPlugin =
-  FlutterLocalNotificationsPlugin();
+    /// 1. App in Foreground
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      RemoteNotification? notification = message.notification;
+      AndroidNotification? android = message.notification?.android;
 
-  String? _fcmToken;
-  bool _isInitialized = false;
-
-  // Callback for chat message notifications
-  Function(String)? _onChatMessageReceived;
-
-  // Callback for refreshing conversations list
-  Function()? _onConversationsRefresh;
-
-  String? get fcmToken => _fcmToken;
-  bool get isInitialized => _isInitialized;
-
-  // Set callback for chat message notifications
-  void setChatMessageCallback(Function(String) callback) {
-    print('📱 Setting chat message callback');
-    _onChatMessageReceived = callback;
-  }
-
-  // Set callback for refreshing conversations
-  void setConversationsRefreshCallback(Function() callback) {
-    print('📱 Setting conversations refresh callback');
-    _onConversationsRefresh = callback;
-  }
-
-  // Remove callback
-  void removeChatMessageCallback() {
-    print('📱 Removing chat message callback');
-    _onChatMessageReceived = null;
-  }
-
-  // Remove conversations refresh callback
-  void removeConversationsRefreshCallback() {
-    print('📱 Removing conversations refresh callback');
-    _onConversationsRefresh = null;
-  }
-
-  Future<void> initialize() async {
-    if (_isInitialized) return;
-
-    try {
-      // Initialize Firebase
-      await Firebase.initializeApp();
-
-      // Request permission for iOS
-      NotificationSettings settings = await _firebaseMessaging.requestPermission(
-        alert: true,
-        announcement: false,
-        badge: true,
-        carPlay: false,
-        criticalAlert: false,
-        provisional: false,
-        sound: true,
-      );
-
-      print('User granted permission: ${settings.authorizationStatus}');
-
-      // Get FCM token
-      _fcmToken = await _firebaseMessaging.getToken();
-      print('FCM Token: $_fcmToken');
-
-      // Save token to SharedPreferences
-      if (_fcmToken != null) {
-        await _saveFcmToken(_fcmToken!);
+      // Trigger the local notification banner for foreground execution
+      if (notification != null && android != null) {
+        flutterLocalNotificationsPlugin.show(
+          notification.hashCode,
+          notification.title,
+          notification.body,
+          NotificationDetails(
+            android: AndroidNotificationDetails(
+              channel.id, // Uses the 'high_importance_channel' from main.dart
+              channel.name,
+              channelDescription: channel.description,
+              icon: '@mipmap/ic_launcher',
+              importance: Importance.max,
+              priority: Priority.high,
+            ),
+          ),
+          payload: message.data.toString(),
+        );
       }
+    });
 
-      // Listen for token refresh
-      _firebaseMessaging.onTokenRefresh.listen((newToken) {
-        _fcmToken = newToken;
-        _saveFcmToken(newToken);
-        print('FCM Token refreshed: $newToken');
+    /// 2. App in Background (User taps notification)
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+      _handleNotificationClick(message);
+    });
+
+    /// 3. App Terminated (Launched via notification tap)
+    final RemoteMessage? initialMessage = await _messaging.getInitialMessage();
+    if (initialMessage != null) {
+      Future.delayed(const Duration(milliseconds: 500), () {
+        _handleNotificationClick(initialMessage);
       });
-
-      // Initialize local notifications
-      await _initializeLocalNotifications();
-
-      // Handle background messages
-      FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-
-      // Handle foreground messages
-      FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
-
-      // Handle notification tap when app is in background/minimized
-      FirebaseMessaging.onMessageOpenedApp.listen(_handleNotificationTap);
-
-      // Check if app was opened from a dead/terminated state via notification
-      RemoteMessage? initialMessage = await _firebaseMessaging.getInitialMessage();
-      if (initialMessage != null) {
-        // A minor 500ms delay ensures MaterialApp is completely drawn and navigatorKey is fully active
-        Future.delayed(const Duration(milliseconds: 500), () {
-          _handleNotificationTap(initialMessage);
-        });
-      }
-
-      _isInitialized = true;
-      print('Firebase Messaging Service initialized successfully');
-    } catch (e) {
-      print('Error initializing Firebase Messaging Service: $e');
     }
   }
 
-  Future<void> _initializeLocalNotifications() async {
-    const AndroidInitializationSettings initializationSettingsAndroid =
-    AndroidInitializationSettings('@mipmap/ic_launcher');
+  void _handleNotificationClick(RemoteMessage message) {
+    final Map<String, dynamic> data = message.data;
 
-    const DarwinInitializationSettings initializationSettingsIOS =
-    DarwinInitializationSettings(
-      requestAlertPermission: false,
-      requestBadgePermission: false,
-      requestSoundPermission: false,
-    );
-
-    const InitializationSettings initializationSettings = InitializationSettings(
-      android: initializationSettingsAndroid,
-      iOS: initializationSettingsIOS,
-    );
-
-    // Create Android notification channel
-    const AndroidNotificationChannel channel = AndroidNotificationChannel(
-      'tall3at_channel',
-      'Tall3at Notifications',
-      description: 'Channel for Tall3at notifications',
-      importance: Importance.high,
-    );
-
-    await _flutterLocalNotificationsPlugin
-        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(channel);
-
-    await _flutterLocalNotificationsPlugin.initialize(
-      initializationSettings,
-      onDidReceiveNotificationResponse: _onNotificationTap,
-    );
-  }
-
-  Future<void> _saveFcmToken(String token) async {
-    try {
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setString('fcm_token', token);
-    } catch (e) {
-      print('Error saving FCM token: $e');
-    }
-  }
-
-  Future<String?> getFcmToken() async {
-    if (_fcmToken != null) return _fcmToken;
-
-    try {
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      _fcmToken = prefs.getString('fcm_token');
-      return _fcmToken;
-    } catch (e) {
-      print('Error getting FCM token: $e');
-      return null;
-    }
-  }
-
-  void _handleForegroundMessage(RemoteMessage message) {
-    print('🔥 Got a message whilst in the foreground!');
-    print('🔥 Message data: ${message.data}');
-
-    // Refresh conversations list for any notification
-    if (_onConversationsRefresh != null) {
-      print('🔥 Notification received, refreshing conversations list');
-      _onConversationsRefresh!();
-    } else {
-      print('🔥 Conversations refresh callback is null');
-    }
-
-    // Refresh messages for any notification
-    if (_onChatMessageReceived != null) {
-      print('🔥 Notification received, refreshing messages');
-      _onChatMessageReceived!('any'); // Pass 'any' to indicate any notification
-    } else {
-      print('🔥 Chat message callback is null');
-    }
-
-    if (message.notification != null) {
-      print('🔥 Message also contained a notification: ${message.notification}');
-      showLocalNotification(message);
-    }
-  }
-
-  // Triggers when a Firebase Background Push Notification is clicked
-  void _handleNotificationTap(RemoteMessage message) {
-    print('Notification tapped (FCM Stream): ${message.data}');
-    _handleNotificationNavigation(message.data);
-  }
-
-  // Triggers when a Local Foreground Notification banner is clicked
-  void _onNotificationTap(NotificationResponse response) {
-    print('Local notification tapped: ${response.payload}');
-    if (response.payload != null && response.payload!.isNotEmpty) {
-      try {
-        // Decode the JSON string payload back into a strongly typed Map
-        final Map<String, dynamic> data = jsonDecode(response.payload!);
-        _handleNotificationNavigation(data);
-      } catch (e) {
-        print('Error parsing local notification payload: $e');
-      }
-    }
-  }
-
-  // Core navigation gateway logic
-  void _handleNotificationNavigation(Map<String, dynamic> data) {
-    print('Handling notification navigation with data: $data');
-
-    // Safety check to verify that your data map contains the routing instruction
+    // Example routing logic: Adjust this to your app's deep-linking requirements
     if (data.containsKey('screen')) {
       final String screen = data['screen'];
-
-      // Route destination pattern 1: Booking System
-      if (screen == 'booking') {
-        final String? bookingId = data['bookingId']?.toString();
-
-        // Target screen navigation using the imported global navigatorKey
-        navigatorKey.currentState?.push(
-          MaterialPageRoute(
-            builder: (context) => BookingDetailScreen(bookingId: bookingId),
-          ),
-        );
-      }
-
-      // Route destination pattern 2: Messaging System
-      if (screen == 'chat') {
-        final String? chatId = data['chatId']?.toString();
+      if (screen == 'booking' && data.containsKey('bookingId')) {
+        final String bookingId = data['bookingId'];
 
         navigatorKey.currentState?.push(
           MaterialPageRoute(
-            builder: (context) => ChatScreen(chatId: chatId),
+            builder: (context) => Scaffold(
+              appBar: AppBar(title: const Text('Booking Details')),
+              body: Center(child: Text('Booking ID: $bookingId')),
+            ),
           ),
         );
       }
     }
   }
 
-  Future<void> showBookingNotification({
-    required String title,
-    required String body,
-    Map<String, dynamic>? data,
-  }) async {
-    // Create a fallback RemoteMessage layout
-    RemoteMessage message = RemoteMessage(
-      notification: RemoteNotification(title: title, body: body),
-      data: data ?? {},
+  Future<void> requestPermission() async {
+    NotificationSettings settings = await _messaging.requestPermission(
+      alert: true,
+      badge: true,
+      sound: true,
     );
-
-    // Pass down to standard localized workflow
-    await showLocalNotification(message);
+    print('Authorization Status: ${settings.authorizationStatus}');
   }
 
-  Future<void> showLocalNotification(RemoteMessage message) async {
-    const AndroidNotificationDetails androidPlatformChannelSpecifics =
-    AndroidNotificationDetails(
-      'tall3at_channel',
-      'Tall3at Notifications',
-      channelDescription: 'Channel for Tall3at app notifications',
-      importance: Importance.max,
-      priority: Priority.high,
-      showWhen: true,
-    );
-
-    const DarwinNotificationDetails iOSPlatformChannelSpecifics =
-    DarwinNotificationDetails(
-      presentAlert: true,
-      presentBadge: true,
-      presentSound: true,
-    );
-
-    const NotificationDetails platformChannelSpecifics = NotificationDetails(
-      android: androidPlatformChannelSpecifics,
-      iOS: iOSPlatformChannelSpecifics,
-    );
-
-    // Convert the data Map to a JSON string so it transfers perfectly across platform lines
-    final String stringPayload = jsonEncode(message.data);
-
-    await _flutterLocalNotificationsPlugin.show(
-      message.hashCode,
-      message.notification?.title ?? 'Tall3at',
-      message.notification?.body ?? '',
-      platformChannelSpecifics,
-      payload: stringPayload,
-    );
+  Future<String?> getToken() async {
+    final token = await _messaging.getToken();
+    print('FCM Token: $token');
+    _messaging.onTokenRefresh.listen((newToken) {
+      print('New FCM Token: $newToken');
+    });
+    return token;
   }
-
-  Future<void> subscribeToTopic(String topic) async {
-    try {
-      await _firebaseMessaging.subscribeToTopic(topic);
-      print('Subscribed to topic: $topic');
-    } catch (e) {
-      print('Error subscribing to topic: $e');
-    }
-  }
-
-  Future<void> unsubscribeFromTopic(String topic) async {
-    try {
-      await _firebaseMessaging.unsubscribeFromTopic(topic);
-      print('Unsubscribed from topic: $topic');
-    } catch (e) {
-      print('Error unsubscribing from topic: $e');
-    }
-  }
-
-  Future<void> deleteToken() async {
-    try {
-      await _firebaseMessaging.deleteToken();
-      _fcmToken = null;
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.remove('fcm_token');
-      print('FCM token deleted');
-    } catch (e) {
-      print('Error deleting FCM token: $e');
-    }
-  }
-}
-
-// Background message handler top level function
-@pragma('vm:entry-point')
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp();
-  print('Handling a background message: ${message.messageId}');
 }
